@@ -51,6 +51,37 @@ Swarm 是 Strands Agents SDK 提供的一种多智能体协作模式，核心理
     ↓ 汇总                            无需中央控制
 ```
 
+### 返工机制
+
+Swarm 支持任意方向的交接，不仅可以向前传递，也可以向后返工。例如 reviewer 发现问题时，可以将任务交回给 coder 或 architect 进行修复。
+
+```
+正常流程：
+researcher → architect → coder → reviewer → 完成
+
+返工流程（reviewer 发现代码问题）：
+researcher → architect → coder → reviewer → coder → reviewer → 完成
+                                    ↑          ↓
+                                    └──── 返工 ────┘
+```
+
+返工机制的关键在于 **system prompt 的设计**，需要明确告诉 Agent 在什么情况下应该交回给谁：
+
+```python
+reviewer = Agent(
+    name="reviewer",
+    model=model,
+    system_prompt="""You are a code reviewer.
+    
+    If you find issues:
+    - Code bugs → hand off back to coder
+    - Architecture flaws → hand off back to architect
+    - Missing requirements → hand off back to researcher
+    
+    Only if everything looks good, provide final solution without handing off."""
+)
+```
+
 ---
 
 ## 2. 代码架构设计
@@ -116,6 +147,17 @@ swarm = Swarm([coder, researcher, architect, reviewer], ...)
 | `execution_timeout` | 总执行超时（秒） | 900 |
 | `node_timeout` | 单个 Agent 超时（秒） | 300 |
 | `repetitive_handoff_detection_window` | 检测乒乓循环的窗口大小 | 0（禁用） |
+| `repetitive_handoff_min_unique_agents` | 窗口内最少需要的不同 Agent 数量 | 0（禁用） |
+
+> **返工场景配置建议**：如果启用返工机制，建议设置 `max_handoffs=15~20`，并启用乒乓检测防止无限循环：
+> ```python
+> swarm = Swarm(
+>     [...],
+>     max_handoffs=15,
+>     repetitive_handoff_detection_window=6,  # 检查最近 6 次交接
+>     repetitive_handoff_min_unique_agents=2   # 至少要有 2 个不同的 Agent
+> )
+> ```
 
 ---
 
@@ -915,7 +957,332 @@ reviewer: 基于所有信息进行审查
 
 ---
 
-## 10. 参考资料
+## 10. 返工机制测试
+
+### 10.1 测试场景
+
+为了验证 Swarm 的返工机制，我们设计了一个更复杂的任务，要求包含 JWT 认证、输入验证、安全配置等，更容易触发 reviewer 的返工要求。
+
+### 10.2 测试配置
+
+```python
+# 关键：reviewer 可以将任务交回给前序 Agent
+reviewer = Agent(
+    name="reviewer",
+    model=model,
+    system_prompt="""You are a senior code reviewer.
+    
+    After review:
+    - If you find CODE issues → Hand off to "coder" with specific issues
+    - If you find ARCHITECTURE issues → Hand off to "architect"
+    - If you find REQUIREMENT issues → Hand off to "researcher"
+    - If everything looks good → Provide final approval WITHOUT handing off
+    
+    Be strict but fair."""
+)
+
+# 配置支持返工
+swarm = Swarm(
+    [researcher, architect, coder, reviewer],
+    max_handoffs=15,
+    max_iterations=20,
+    repetitive_handoff_detection_window=6,
+    repetitive_handoff_min_unique_agents=2
+)
+```
+
+### 10.3 测试输出详解
+
+#### 阶段一：Swarm 初始化
+
+```
+DEBUG | strands.multiagent.swarm | nodes=<['researcher', 'architect', 'coder', 'reviewer']> | initialized swarm with nodes
+DEBUG | strands.multiagent.swarm | tool_count=<1>, node_count=<4> | injected coordination tools into agents
+============================================================
+🚀 Starting Swarm with Rework Mechanism
+============================================================
+
+Task: Design and implement a REST API for a todo app with the following requirements:
+1. CRUD operations for todos
+2. User authentication (JWT)
+3. Input validation
+4. Proper error responses with status codes
+5. Pagination for list endpoints
+
+DEBUG | strands.multiagent.swarm | starting swarm execution
+DEBUG | strands.multiagent.swarm | current_node=<researcher> | starting swarm execution with node
+DEBUG | strands.multiagent.swarm | max_handoffs=<15>, max_iterations=<20>, timeout=<900.0>s | swarm execution config
+```
+
+**日志解读：**
+- 任务比简单测试更复杂，包含 JWT 认证、输入验证等安全要求
+- `max_handoffs=<15>`：允许更多交接以支持返工
+- `max_iterations=<20>`：允许更多迭代
+
+---
+
+#### 阶段二：正常流程（迭代 1-4）
+
+```
+DEBUG | strands.multiagent.swarm | current_node=<researcher>, iteration=<1> | executing node
+... researcher 完成需求调研 ...
+DEBUG | strands.multiagent.swarm | from_node=<researcher>, to_node=<architect> | handed off
+
+DEBUG | strands.multiagent.swarm | current_node=<architect>, iteration=<2> | executing node
+... architect 完成架构设计 ...
+DEBUG | strands.multiagent.swarm | from_node=<architect>, to_node=<coder> | handed off
+
+DEBUG | strands.multiagent.swarm | current_node=<coder>, iteration=<3> | executing node
+... coder 完成初版实现 ...
+DEBUG | strands.multiagent.swarm | from_node=<coder>, to_node=<reviewer> | handed off
+
+DEBUG | strands.multiagent.swarm | current_node=<reviewer>, iteration=<4> | executing node
+```
+
+**reviewer 第一次审查发现问题：**
+```
+I notice some potential security concerns that need to be addressed:
+1. Missing rate limiting for authentication endpoints
+2. No specification of JWT expiration and refresh mechanism
+3. No CORS policy defined
+4. No input sanitization mentioned beyond validation
+
+Given these security concerns, I'll hand off to the coder to implement these security improvements:
+Tool #1: handoff_to_agent
+```
+
+---
+
+#### 阶段三：第一次返工（迭代 5）
+
+```
+DEBUG | strands.multiagent.swarm | from_node=<reviewer>, to_node=<coder> | handed off from agent to agent
+DEBUG | strands.multiagent.swarm | node=<reviewer> | node execution completed
+DEBUG | strands.multiagent.swarm | current_node=<coder>, iteration=<5> | executing node
+```
+
+**🔑 返工触发：** reviewer 发现安全问题，将任务交回给 coder
+
+**coder 收到的反馈：**
+```
+Handoff Message: Please implement these security enhancements:
+- Rate limiting (5 req/min for auth, 100 req/min for API)
+- JWT token expiration (15m access, 7d refresh)
+- CORS configuration
+- Input sanitization using xss package
+```
+
+**coder 修复后再次提交：**
+```
+This implementation includes all the requested security enhancements...
+Let me hand this off to the reviewer for final verification:
+Tool #2: handoff_to_agent
+```
+
+---
+
+#### 阶段四：第二次审查（迭代 6）
+
+```
+DEBUG | strands.multiagent.swarm | from_node=<coder>, to_node=<reviewer> | handed off
+DEBUG | strands.multiagent.swarm | current_node=<reviewer>, iteration=<6> | executing node
+```
+
+**reviewer 要求进一步验证：**
+```
+I need to verify specific security implementation details:
+- Rate limiting exact values
+- JWT token expiry settings
+- Password hashing configuration
+- CORS implementation
+
+I'll hand off to the coder for specific implementation verifications:
+Tool #2: handoff_to_agent
+```
+
+---
+
+#### 阶段五：第二次返工（迭代 7）
+
+```
+DEBUG | strands.multiagent.swarm | from_node=<reviewer>, to_node=<coder> | handed off
+DEBUG | strands.multiagent.swarm | current_node=<coder>, iteration=<7> | executing node
+```
+
+**coder 提供详细配置验证：**
+```python
+# config/config.ts - 明确的安全配置
+export const config = {
+  jwt: {
+    accessTokenExpiry: '15m',    // 15分钟
+    refreshTokenExpiry: '7d'     // 7天
+  }
+};
+
+// middleware/rateLimiter.ts
+export const authRateLimiter = rateLimit({
+  windowMs: 60 * 1000,  // 1分钟
+  max: 5                // 5次请求
+});
+
+// bcrypt 配置
+const BCRYPT_ROUNDS = 10;  // 行业标准
+```
+
+---
+
+#### 阶段六：最终审批（迭代 8）
+
+```
+DEBUG | strands.multiagent.swarm | from_node=<coder>, to_node=<reviewer> | handed off
+DEBUG | strands.multiagent.swarm | current_node=<reviewer>, iteration=<8> | executing node
+```
+
+**reviewer 最终审批：**
+```
+Security Analysis:
+1. Rate Limiting: ✓ Properly implemented
+2. JWT Implementation: ✓ Well configured
+3. Password Security: ✓ Meets standards (bcrypt with 10 rounds)
+4. CORS: ✓ Securely configured
+5. Input Validation: ✓ Comprehensive
+
+The implementation is APPROVED for production use.
+```
+
+---
+
+#### 阶段七：Swarm 结束
+
+```
+DEBUG | strands.multiagent.swarm | node=<reviewer> | no handoff occurred, marking swarm as complete
+DEBUG | strands.multiagent.swarm | status=<Status.COMPLETED> | swarm execution completed
+DEBUG | strands.multiagent.swarm | node_history_length=<8>, time=<258.43>s | metrics
+```
+
+**日志解读：**
+- `no handoff occurred`：reviewer 最终批准，不再交接
+- `node_history_length=<8>`：共 8 次迭代（比简单测试的 4 次多一倍）
+- `time=<258.43>s`：总耗时约 4.3 分钟
+
+### 10.4 测试结果统计
+
+```
+==================================================
+🔄 Agent 执行顺序（含返工）
+==================================================
+researcher → architect → coder → reviewer → coder → reviewer → coder → reviewer
+
+各 Agent 调用次数:
+  researcher: 1 次
+  architect: 1 次
+  coder: 3 次 (有返工)
+  reviewer: 3 次 (有返工)
+
+==================================================
+📊 执行结果概览
+==================================================
+状态: Status.COMPLETED
+总执行时间: 258430ms（约 4.3 分钟）
+总迭代次数: 8
+
+==================================================
+💰 Token 使用统计
+==================================================
+Input tokens: 59580
+Output tokens: 23827
+```
+
+### 10.4 测试结果统计
+
+```
+==================================================
+🔄 Agent 执行顺序（含返工）
+==================================================
+researcher → architect → coder → reviewer → coder → reviewer → coder → reviewer
+
+各 Agent 调用次数:
+  researcher: 1 次
+  architect: 1 次
+  coder: 3 次 (有返工)
+  reviewer: 3 次 (有返工)
+
+==================================================
+📊 执行结果概览
+==================================================
+状态: Status.COMPLETED
+总执行时间: 258430ms（约 4.3 分钟）
+总迭代次数: 8
+
+==================================================
+💰 Token 使用统计
+==================================================
+Input tokens: 59580
+Output tokens: 23827
+```
+
+### 10.5 返工流程分析
+
+```
+迭代 1-4: 正常流程
+researcher → architect → coder → reviewer
+                                    │
+                                    ▼ reviewer 发现安全问题
+迭代 5: 第一次返工               
+reviewer → coder（要求添加 rate limiting、JWT expiry 等）
+                │
+                ▼
+迭代 6: coder 修复后再次提交
+coder → reviewer
+            │
+            ▼ reviewer 要求验证具体配置
+迭代 7: 第二次返工
+reviewer → coder（要求确认安全配置细节）
+                │
+                ▼
+迭代 8: 最终审批
+coder → reviewer → 完成（所有安全要求满足）
+```
+
+### 10.6 返工触发的问题
+
+reviewer 在第一次审查时发现的问题：
+
+1. **缺少 rate limiting**：认证端点需要限流防止暴力破解
+2. **JWT 过期机制不明确**：需要明确 access token 和 refresh token 的过期时间
+3. **CORS 配置缺失**：需要配置跨域策略
+4. **输入消毒不完整**：需要 XSS 防护
+
+### 10.7 返工机制验证
+
+| 验证项 | 结果 |
+|--------|------|
+| reviewer 能否交回给 coder | ✓ 成功触发 2 次 |
+| coder 能否接收反馈并修复 | ✓ 每次都针对性修复 |
+| 共享知识是否正确累积 | ✓ 包含所有迭代的上下文 |
+| 乒乓检测是否工作 | ✓ 未触发（有足够的不同 Agent） |
+| 最终能否正常结束 | ✓ reviewer 最终批准 |
+
+### 10.8 返工 vs 无返工对比
+
+| 指标 | 无返工（简单任务） | 有返工（复杂任务） |
+|------|-------------------|-------------------|
+| 迭代次数 | 4 | 8 |
+| 执行时间 | 73.67s | 258.43s |
+| Input Tokens | 9,134 | 59,580 |
+| Output Tokens | 3,577 | 23,827 |
+| 代码质量 | 基础实现 | 生产级安全配置 |
+
+### 10.9 返工机制总结
+
+1. **返工是 Swarm 的核心能力**：支持任意方向的交接，不仅是线性流程
+2. **System Prompt 是关键**：需要明确告诉 Agent 在什么情况下返工
+3. **安全配置很重要**：启用乒乓检测防止无限循环
+4. **成本会增加**：返工会显著增加 Token 消耗，需要权衡质量和成本
+
+---
+
+## 11. 参考资料
 
 - [Strands Agents 官方文档](https://strandsagents.com/latest/documentation/docs/user-guide/concepts/multi-agent/swarm/)
 - [Strands Agents GitHub](https://github.com/strands-agents/strands-agents)
